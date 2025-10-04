@@ -1,0 +1,116 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: fluent-bit-s3
+  namespace: argocd
+spec:
+  project: default
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: logging
+  source:
+    repoURL: https://github.com/fluent/helm-charts.git
+    path: charts/fluent-bit
+    targetRevision: fluent-bit-0.52.0
+    helm:
+      values: |
+        serviceAccount:
+        create: true
+        name: fluent-bit-s3
+
+      # Initialize these environment variables
+      # To make the S3 Sink be able to write into your bucket
+      env:
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: s3-auth
+              key: access_key
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: s3-auth
+              key: secret_key
+
+      # Here's our Lua function that will discard
+      # all the records that do not have our app label
+      # and set as the top level attribute of the log record
+      # both the namespaces and the app name
+      luaScripts:
+        custom_script.lua: |
+          function edit_record(tag, timestamp, record)
+              if record["kubernetes"] ~= nil then
+                  local ns     = record["kubernetes"]["namespace_name"]
+                  local labels = record["kubernetes"]["labels"]
+
+                  if ns ~= nil and labels ~= nil and labels["app"] ~= nil then
+                      local app = labels["app"]
+                      record["app"] = app
+                      record["namespace"] = ns
+                      record["kubernetes"] = nil
+                      return 2, timestamp, record, tag
+                  end
+              end
+              return -1, timestamp, record
+          end
+
+      config:
+        # Daemon configuration
+        service: |
+          [SERVICE]
+              Flush         5
+              Log_Level     info
+              HTTP_Server   On
+              HTTP_Listen   0.0.0.0
+              HTTP_Port     {{ .Values.metricsPort }}
+              Health_Check  On
+
+        # Input configuration
+        inputs: |
+          [INPUT]
+              Name              tail
+              Path              /var/log/containers/*.log
+              Parser            docker
+              Tag               kube.*
+              Refresh_Interval  5
+              DB                /var/log/flb_kube.db
+              Mem_Buf_Limit     5MB
+              buffer_chunk_size 512k
+              buffer_max_size   1m
+              Skip_Empty_Lines  On
+
+        # Kubernetes filter plugin + custom script + re-emit on custom tag
+        filters: |
+          [FILTER]
+              Name             kubernetes
+              Match            kube.*
+              Merge_Log        Off
+              Keep_Log         On
+              K8S-Logging.Parser Off
+              K8S-Logging.Exclude Off
+          
+          
+          [FILTER]
+              Name    lua
+              Match   kube.*
+              script  /fluent-bit/scripts/custom_script.lua
+              call    edit_record
+
+          [FILTER]
+              Name          rewrite_tag
+              Match         kube.*
+              Rule          $app ^(.+)* s3sink.$namespace.$app false
+              Emitter_Name  re_emitted
+
+        # Finally write the logs into s3 using the $TAG for routing
+        outputs: |
+          [OUTPUT]
+              Name             s3
+              Match            s3sink.*
+              bucket           bucket-name
+              region           eu-west-1
+              total_file_size  50M
+              upload_timeout   60m
+              store_dir        /var/log/fluent-bit-buffer
+              s3_key_format    /logs/cluster=test/namespace=$TAG[1]/job=$TAG[2]/date=%Y-%m-%d/hour=%H-$UUID.json
+              use_put_object   On
